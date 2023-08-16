@@ -1,0 +1,561 @@
+%% -*- mode: Noweb; noweb-code-mode: c-mode -*-
+\documentclass[letterpaper,twoside,12pt]{article}
+\usepackage{graphicx}\usepackage{newpxtext,newpxmath}\usepackage{microtype}
+\usepackage{noweb}\pagestyle{plain}
+\ifhtml\else\makeatletter\let\obeyedspace\@xobeysp\makeatother\fi
+\begin{document}
+\title{A Mechanism for Allocating Memory}
+\author{Dakotah Lambert}
+\date{}
+\maketitle
+\tableofcontents
+
+\section{Introduction}
+Most programs dynamically allocate some amount of memory at runtime.
+Programmers are generally shielded from the complexity of this task:
+simply ask the operating system for some memory
+and release it when it is no longer needed.
+But someone has to write the operating system.
+And sometimes, perhaps to ensure better locality of references,
+one might wish to use a custom allocator
+over a small predefined pool of objects,
+rather than relying on the operating system implementation.
+
+Any allocator will contain at least two basic functions,
+which we shall call [[allocate]] and [[release]].
+We use [[allocate]] to request a block of memory,
+and [[release]] to return this memory to the system
+for future allocations.
+Often, a reallocation function will be provided as well,
+so that a programmer can conveniently enlarge existing objects.
+We shall leave reallocation as an exercise
+and implement only the two required operations.
+<<API>>=
+char * allocate(size_t);
+void release(char *);
+@
+We shall define some parameters as well.
+In a real system,
+these parameters might be discovered upon initialization
+rather than being fixed at compile time.
+<<configuration>>=
+#define      `MEMBIT 15U
+#define     `MEMSIZE (1U<<MEMBIT)
+#define     `MEMMASK (MEMSIZE - 1U)
+#define   `MEMMINBIT 4U
+#define `MEMMINALLOC (1U<<MEMMINBIT)
+@
+Here we specify that the system has $2^{15}=32768$ bytes of memory,
+and the minimum unit of allocation is $2^4=16$ bytes.
+As we shall see,
+an allocation consists of both data and metadata,
+so a sixteen-byte block holds only fifteen bytes of user data.
+
+Our simple allocator relies on memory being a power of two in size,
+and represents the entire region as a perfect binary tree.
+The Gorn address of a node will correspond to where, physically,
+in memory that node appears.
+
+\section{Binary Trees and Gorn Addressing}
+A tree is a recursive data structure.
+It may be empty, or it may be a node with zero or more trees as children.
+A node with zero children is a \textbf{leaf} node,
+and any other node is an \textbf{interior} node.
+A tree is \textbf{binary} if no node has more than two children.
+Further a \textbf{perfect} binary tree
+is a binary tree in which every interior node has two children,
+and every leaf node is at the same generation
+as all the other leaf nodes.
+Figure~\ref{fig:pbt} depicts such a tree.
+
+\begin{figure}
+\ifhtml
+\includegraphics{pbt.png}
+\else
+\includegraphics[width=\linewidth]{pbt}
+\fi
+
+\caption{A perfect binary tree with fifteen nodes.}
+\label{fig:pbt}
+\end{figure}
+
+Begin at the root: the top node labeled 1.
+From there, we can reach any node by moving only downward.
+Append a zero when moving to a left child
+or a one when moving to a right child,
+and you'll have the Gorn address of the node.
+For instance, the node numbered 11 is at address 011,
+as you first move left from 1 to 2, then right from 2 to 5,
+then right again from 5 to 11.
+The node numbered 3 is at address 1,
+as you only move right from 1 to 3.
+
+The Gorn address is useful for our purposes,
+as we can see that the node at address 00 (4)
+encompasses the nodes at addresses 000 (8) and 001 (9).
+The node at address 1 (3)
+contains all of the nodes at 10 (6), 11 (7),
+100 (12), 101 (13), 110 (14), and 111(15).
+That is, node 1 can be imagined as node 1??\@,
+the root as node ???\@, and so on,
+where the question-mark symbol represents both zero and one.
+One method by which we might locate nodes in physical space
+would be to instantiate each question-mark as zero
+and interpret the result as a binary number: a location in memory.
+We'll call this a node address.
+Figure~\ref{fig:pbt-in-mem} shows the same tree as Figure~\ref{fig:pbt}
+but with nodes labeled by their physical address.
+Notice that each node lives at the same address
+as every node in its chain of left-children.
+
+\begin{figure}
+\ifhtml
+\includegraphics{pbt-addr.png}
+\else
+\includegraphics[width=\linewidth]{pbt-addr}
+\fi
+
+\caption{Node addresses from Gorn addresses.}
+\label{fig:pbt-in-mem}
+\end{figure}
+
+Consider each leaf node as an allocation unit.
+The next level up consists of the parents of these nodes:
+each of these parent nodes represents a doubly-wide allocation.
+Each of their parents in turn represents
+an allocation spanning four units,
+and so on, doubling each time.
+Notice that the leaf nodes are simply counting up in binary from 0.
+If allocation units are not single bytes,
+then these addresses should be multiplied
+by the size of an allocation unit.
+For simplicity, we ought to use a power of two as our allocation size:
+then we simply add more zeroes to the end of the addresses.
+If the minimum allocation size is sixteen bytes,
+then the leaves would be at address 0, 16, 32, 48, and so on.
+
+Let us assume that this will be the structure of our system.
+The smallest allocations inhabit leaf nodes,
+the next larger size inhabit the parents of leaf nodes,
+and so on.
+Suppose that we have already allocated memory to a process,
+and it wishes to return that memory to the system.
+It tells us that it is done with the memory at node address 010.
+How do we know what size the allocation was?
+It might be minimum-size, or it might be double that,
+but it cannot be larger.
+
+In order to disambiguate node sizes,
+we should store the height of the node as metadata upon allocation.
+Let 0 represent an unallocated space,
+1 represent a minimum-size allocation,
+2 a double-size allocation,
+3 the next size up, and so on.
+When we allocate space, we'll write this value into the node address,
+and return a pointer to the next byte,
+the remainder of the allocation unit,
+to the inquiring program.
+
+Then to deallocate,
+we should read the value stored in the metadata block
+in order to determine how many allocation units to mark as free.
+
+The [[release]] function takes in a pointer returned by [[allocate]]
+and marks all associated memory as free to use in future allocations.
+<<functions>>=
+void
+`release(char *p)
+{
+	int const level = *(p - 1); /* read the metadata */
+	int i;
+	if (!level) return;
+	/* mark the node and each child free */
+	for (i = 0; i < (1<<(level - 1)); ++i) {
+		*(p - 1 + i*MEMMINALLOC) = 0;
+	}
+}
+@
+The node itself and every subnode is marked free,
+which can be considerably faster than zeroing out the entire region.
+No matter what mechanism we use for allocation,
+this will deallocate correctly as long as nodes are used properly.
+That is, as long as allocations always correspond to exactly one node.
+To reiterate, this deallocator is generic,
+but it does place a condition on what the allocation function must do:
+namely, it must write the node's height in the allocated node's address,
+and return the location of the subsequent byte as the data pointer.
+Further, it must consider nodes whose metadata block is 0 as free.
+
+We can embody these conditions in a function
+that tells us whether a node is allocated or free.
+A node is clearly unavailable if its metadata block is nonzero.
+But there are two other cases in which it may be unavailable.
+One of its ancestor nodes might be allocated to an extent
+that covers the desired node.
+Or one of the node's children within the desired region
+might already be in use.
+
+[[is_used]] returns 0 if the location is available
+for allocation of the intended size, else nonzero.
+<<private functions>>=
+static int
+`is_used(size_t n, size_t level)
+{
+	size_t mask = MEMMASK<<MEMMINBIT;
+	size_t i = 0;
+	size_t j = 0;
+	if (!level) return 1; /* level 0 can't exist */
+	/* check alignment */
+	if (n & ((1U<<(level-1))-1U)) return 1;
+	/* check the node and its ancestors */
+	while (mask) {
+		if (mem[n & mask] > i) return 1;
+		++j;
+		if (n & (((~mask) & MEMMASK) + 1U)) i = j;
+		mask = (mask<<1) & MEMMASK;
+	}
+	if (mem[0] > i) return 1;
+	/* avoid overwriting allocated subnodes */
+	if (level < 2) return 0;
+	for (i = 0; i < (1U<<(level - 1)); ++i) {
+		if (mem[n + i*MEMMINALLOC]) return 1;
+	}
+	return 0;
+}
+@
+\section{Placing Objects}
+The simplest possible system for placing objects
+is a "first-fit" approach.
+First, we must decide how large our allocation must be.
+Then we can march along the nodes at the required level
+in search of an available node.
+Once found, the level is written in the metadata block
+and a pointer to the data block is returned.
+Failing that, we return NULL, a failed allocation.
+
+<<functions>>=
+char *
+`allocate(size_t n)
+{
+	size_t p = 0;
+	size_t level = 0;
+	size_t stride = MEMMINALLOC;
+	for (level = 0; level < MEMBIT - MEMMINBIT; ++level) {
+		if (stride > n) break;
+		stride <<= 1;
+	}
+	if (stride <= n) return NULL; /* too big */
+	++level;
+	for (p = 0; p < MEMSIZE; p += stride) {
+		if (!is_used(p, level)) {
+			mem[p] = level;
+			return mem + p + 1;
+		}
+	}
+	/* if we reach here, we could not allocate */
+	return NULL;
+}
+@
+One may notice that if a region is already allocated,
+then we know how much further in memory to skip ahead.
+It is either the next node on the desired level,
+or the end of the existing allocation,
+whichever comes later.
+Doing this skip could save many tests over the simple approach.
+
+A different kind of improvement comes in the allocation strategy itself.
+Rather than searching linearly for the first available allocation point,
+we might try to find the smallest available allocation point.
+That would be a \textbf{best-fit} approach,
+contrasting the example \textbf{first-fit} approach.
+
+\section{A Test Program}
+In order to verify that our system works as expected,
+we should include a test program.
+This program should behave as follows.
+First, it should initialize memory to 0.
+Then it should run for several iterations,
+randomly deciding whether to initialize or destroy
+objects of random sizes.
+At each iteration, it should display a summary of the memory.
+This will show us whether the allocator behaves as expected.
+
+For ease of inspection,
+our test program shall output an image.
+Objects shall be given a nonblack, nonwhite colour upon allocation.
+Each row of the image will consist of one pixel per allocation unit,
+whose colour represents the object at that location, if any,
+else black.
+However, if an allocation failed on a given timestep,
+that row shall be filled entirely with white.
+Then previous and subsequent rows may be compared to determine
+what may have been the cause of the failure.
+The result might resemble Figure~\ref{fig:sample-run}.
+\begin{figure}
+\ifhtml
+\includegraphics{sample-run.png}
+\else
+\includegraphics[width=\linewidth]{sample-run}
+\fi
+
+\caption{Output captured from a sample run of the test program.}
+\label{fig:sample-run}
+\end{figure}
+
+
+Essentially, the structure is as follows:
+<<main test>>=
+int
+main(void)
+{
+	char * tc = NULL;
+	int i;
+	float h = 0.0f;
+	float s = 0.6f;
+	float y = 0.5f;
+	int x;
+	srand(time(NULL));
+	for (i = 0; i < sizeof(mem)/sizeof(mem[0]); ++i) {
+		mem[i] = 0;
+	}
+	printf("P6\n%d %d\n%d\n",
+	       MEMREGIONS, ITERATIONS, UCHAR_MAX);
+	for (i = 0; i < ITERATIONS; ++i) {
+		print_mem();
+		if (should_alloc()) {
+			/* allocate something */
+			tc = allocate(allocation_size());
+			if (!tc) { failed = 1; continue; }
+			*tc = (char)(roundf(h*CHAR_MAX));
+			*(tc + 1) = (char)(roundf(s*CHAR_MAX));
+			*(tc + 2) = (char)(roundf(y*CHAR_MAX));
+			h = fmodf(h + (sqrtf(5) - 1.0f)/2.0f,1.0f);
+			y += 0.25f;
+			if (y > 0.875f) y = 0.25f;
+		} else {
+			/* release something */
+			if (!nallocs()) continue;
+			x = rand() % nallocs();
+			free_nth(x);
+		}
+	}
+	return 0;
+}
+@
+In order to avoid additional imports,
+the output will be a NetPBM image.
+The details of this format are not particularly relevant,
+but it is an uncompressed bitmap image
+representing each pixel in turn
+via one byte of red, one byte of green, and one byte of blue.
+For ease of visualization, we will use the HSL colour model.
+<<pixel printing>>=
+static void
+`hslrgb(float h, float s, float y)
+{
+	float c = (1.0f - fabsf(2.0f*y - 1.0f)) * s;
+	float f = fmodf(360.0f*h/60.0f,2.0f);
+	float x = c*(1.0f - fabsf(f - 1.0f));
+	float m = y - c/2.0f;
+	int i = (int)(floorf(h*360.0f/60.0f));
+	float r = (i == 0 || i == 5) ? c : x*(i == 1 || i == 4);
+	float g = (i > 3) ? 0 : (i == 0 || i == 3) ? x : c;
+	float b = (i < 2) ? 0 : (i == 2 || i == 5) ? x : c;
+	printf("%c%c%c",
+	       (unsigned char)(floorf((r+m)*UCHAR_MAX)),
+	       (unsigned char)(floorf((g+m)*UCHAR_MAX)),
+	       (unsigned char)(floorf((b+m)*UCHAR_MAX)));
+}
+@
+Printing the entirety of memory consists of determining which object,
+if any, inhabits a location,
+then displaying the appropriate colours.
+<<memory printing>>=
+static void
+`print_mem(void)
+{
+	char * tc;
+	int i;
+	int j;
+	int x;
+	for (i = 0; i < MEMREGIONS; ++i) {
+		if (failed) {
+			printf("%c%c%c",UCHAR_MAX,UCHAR_MAX,UCHAR_MAX);
+		} else if (mem[i*MEMMINALLOC]) {
+			tc = mem + i*MEMMINALLOC;
+			x = 1U<<((*tc)-1);
+			for (j = 0; j < x; ++j) {
+				hslrgb((float)(*(tc + 1))/CHAR_MAX,
+				       (float)(*(tc + 2))/CHAR_MAX,
+				       (float)(*(tc + 3))/CHAR_MAX);
+			}
+			i += x - 1;
+		} else {
+			printf("%c%c%c",0,0,0);
+		}
+	}
+	failed = 0;
+}
+@
+In order to select a random object to free,
+we first determine how many objects exist in memory.
+Then upon choosing a random number up to that count,
+we can [[release]] the right object.
+
+<<object analysis>>=
+static int
+`nallocs(void)
+{
+	size_t p = 0;
+	int x = 0;
+	while (p < MEMSIZE) {
+		if (mem[p]) {
+			++x;
+			p += (MEMMINALLOC<<(mem[p] - 1));
+		} else {
+			p += MEMMINALLOC;
+		}
+	}
+	return x;
+}
+
+static void
+`free_nth(size_t n)
+{
+	size_t p = 0;
+	int x = -1;
+	while (p < MEMSIZE) {
+		if (mem[p]) {
+			++x;
+			if (x == n) break;
+			p += (MEMMINALLOC<<(mem[p] - 1));
+		} else {
+			p += MEMMINALLOC;
+		}
+	}
+	if (p >= MEMSIZE) return;
+	release(mem + p + 1);
+}
+@
+Finally we provide two functions that act as paramters
+for deciding whether to do an allocation or a deallocation,
+and, if the former, for deciding the size of the requested object.
+<<randomization>>=
+static int
+`should_alloc(void)
+{
+	unsigned int x = ((long)(RAND_MAX) + 1)>>1;
+	unsigned int i = x;
+	i |= i>>1;
+	i |= i>>2;
+	return !!((rand() & i) & (x>>1));
+}
+
+static int
+`allocation_size(void)
+{
+	return rand() % (MEMSIZE/16);
+}
+@
+\section{Shortcomings}
+This simple allocator is not perfect.
+In this section, we will discuss a few of the issues one might encounter,
+as well as some potential kinds of solutions to the problems.
+No list will be exhaustive,
+and readers are encouraged to ponder potential improvements.
+
+Consider our original binary tree with fifteen nodes.
+Suppose that nodes 8, 11, 12, 13, 14, and 15 are allocated,
+leaving 9 and 10 as the only free space.
+There are two consecutive allocation units available,
+but our system here will not allow a doubly-wide allocation.
+There is no unused level-two node.
+This will result in an allocation failure
+despite there being sufficient available contiguous memory.
+One might like to allow allocations of any size at any location.
+In order to do so, one still must track which regions are available,
+but memory might no longer be seen as a tree.
+
+It is true that, on some systems,
+some data types require alignment,
+which would alleviate this concern to some degree.
+However, a new concern surfaces on such systems:
+our metadata byte lies leftmost in each node,
+misaligning all data types!
+This could be avoided by moving the metadata block
+to the right edge of the node instead of the left edge.
+The C standard library [[malloc]] function guarantees
+that the returned pointer is aligned properly for any type,
+while [[aligned_alloc]] might have only the specified alignment.
+It is worth considering what the differences might be.
+
+Whether the metadata lies on the left edge or the right,
+a buffer overrun will corrupt the structure used by the allocator.
+This is because the allocator's data structure is scattered
+throughout the userspace memory.
+A different mechanism could allow for separation
+between the two.
+
+\section{Exercises}
+\begin{enumerate}
+\item Determine the time-complexity of [[allocate]] and [[release]].
+\item Improve [[allocate]] by skipping checks
+of nodes that share an address.
+\textit{Hint: mind the test program.}
+\item Put the metadata byte on the right edge of a node
+instead of the left.
+\item Use the \textbf{best-fit} strategy
+instead of the \textbf{first-fit} strategy.
+\item Implement [[reallocate]], whose signature is as follows:
+
+[[char * reallocate(char *, size_t);]]
+
+When given a valid allocated pointer and a desired size,
+this function should extend the allocation to at least the desired size.
+If this cannot be done in-place,
+then a new sufficiently large allocation should be created
+and the original data copied into it.
+In this case, the original pointer should be released.
+If the extension is still impossible,
+a [[NULL]] pointer should be returned.
+In all other cases,
+the return value should be a pointer to the extended allocation.
+\item Extend the system to allow for memory sizes
+that do not form a perfect binary tree.
+\end{enumerate}
+
+\appendix
+\section{Files}
+<<allocator.c>>=
+#include <stddef.h>
+<<configuration>>
+char `mem[MEMSIZE];
+<<API>>
+<<private functions>>
+<<functions>>
+<<test.c>>=
+#include <limits.h>
+#include <math.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+<<configuration>>
+#define  `MEMREGIONS (1U<<(MEMBIT-MEMMINBIT))
+#define `ITERATIONS MEMREGIONS
+extern char mem[MEMSIZE];
+<<API>>
+static int `failed;
+<<randomization>>
+<<object analysis>>
+<<pixel printing>>
+<<memory printing>>
+<<main test>>
+@
+\section*{Indices}
+\subsection*{Code Chunks}
+\nowebchunks
+
+\subsection*{Identifiers}
+\nowebindex
+\end{document}
