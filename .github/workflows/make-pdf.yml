@@ -1,0 +1,21 @@
+name: CI-CD
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+    - name: Configure build environment
+      run: sudo apt-get update && sudo apt-get install -y graphviz noweb texlive texlive-fonts-extra
+    - name: Build
+      run: make allocator.pdf
+    - name: Release
+      run: gh release create latest ./allocator.pdf
+      env:
+        GH_TOKEN: ${{ github.token }}
