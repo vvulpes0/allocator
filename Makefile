@@ -1,5 +1,6 @@
 .SUFFIXES : .c .gv .html .nw .o .pdf .png .tex
 .MAIN : all
+LDLIBS+=-lm
 
 .gv.png :
 	dot -Tpng $< > $@
@@ -24,13 +25,13 @@
 all : allocator.html allocator.pdf test
 
 allocator.c : allocator.nw
-	notangle -filter btdefn -R$@ $> > $@
+	notangle -filter btdefn -R$@ $> $^ > $@
 
 test.c : allocator.nw
-	notangle -filter btdefn -R$@ $> > $@
+	notangle -filter btdefn -R$@ $> $^ > $@
 
 test : test.o allocator.o
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $> $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $> $^ $(LDLIBS)
 
 allocator.html : allocator.nw pbt.png pbt-addr.png
 allocator.pdf : allocator.tex pbt.pdf pbt-addr.pdf
